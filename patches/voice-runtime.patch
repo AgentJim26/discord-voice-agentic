@@ -1,0 +1,756 @@
+--- a/dist/.setup/voice-runtime-DDymtIw8.mjs
++++ b/dist/.setup/voice-runtime-DDymtIw8.mjs
+@@ -1,4 +1,7 @@
+ import { t as __exportAll } from "./rolldown-runtime-B4FMCO8f.mjs";
++import { readFileSync, writeFileSync } from "node:fs";
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
+ import { a as noteVoiceDecryptFailure, n as analyzeVoiceReceiveError, p as writeVoiceWavFile, r as createVoiceReceiveRecoveryState, s as resetVoiceReceiveRecoveryState, t as DECRYPT_FAILURE_WINDOW_MS, v as restoreDiscordAudioError } from "./receive-recovery-DgkX7Qvi.mjs";
+ import { S as formatDiscordUserTag, g as resolveDiscordOwnerAccess, o as normalizeDiscordSlug } from "./allow-list-vxkG9_JD.mjs";
+ import { _t as getGuildVoiceState, l as ReadyListener, p as VoiceStateUpdateListener, t as discord_exports, u as ResumedListener, y as isUnknownDiscordVoiceStateError } from "./discord-9gysrhzp.mjs";
+@@ -31,6 +34,169 @@
+ import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "openclaw/plugin-sdk/process-runtime";
+ //#region extensions/discord/src/voice/log-preview.ts
+ const DISCORD_VOICE_LOG_PREVIEW_CHARS = 500;
++const AGENTIC_WAKE_SOUND = "/home/jim/.openclaw/extensions/discord/assets/agentic-wake.mp3";
++const AGENTIC_DONE_SOUND = "/home/jim/.openclaw/extensions/discord/assets/agentic-done.mp3";
++const AGENTIC_STATE_PATH = `${process.env.HOME ?? "/home/jim"}/.openclaw/state/discord-voice-agentic.json`;
++const AGENTIC_SOUND_TIMEOUT_MS = 1500;
++// Keep the listening window open while voice energy continues. This is a
++// word-gap timeout, not a fixed request timer.
++// Safety fallback only. Normal end-of-listening is driven by the 3s speech
++// endpointer so a long question is never cut off by a short fixed timer.
++const AGENTIC_STOP_MS = 30000;
++const OPENCLAW_BIN = process.env.OPENCLAW_BIN ?? "/home/jim/.npm-global/bin/openclaw";
++const execFileAsync = promisify(execFile);
++// Deliberately not anchored: Vosk often prefixes the wake phrase with "uh"
++// or a partial word. Match the wake phrase anywhere and treat the remainder
++// as the command.
++const AGENTIC_WAKE_RE = /\b(?:hey|hi|hello|hay)[\s,]+(?:jimbo|jimbot|jim|jym|gym)\b[\s,.:;!?-]*(.*)$/is;
++const AGENTIC_CLOSING_RE = /^(?:thanks|thank you|that's all|thats all|stop|bye|goodbye|never mind|nevermind|we're done|were done)\b/i;
++function cleanAgenticCommand(raw) {
++	const text = (raw ?? "").trim();
++	if (!text) return "";
++	// Repeated wake phrases and bare fillers are not commands. This prevents
++	// "hi jim ... hey jim" from being treated as an instant stop/answer turn.
++	if (AGENTIC_WAKE_RE.test(text)) return "";
++	if (/^(?:uh|um|er|ah|huh|hmm|mm|hm|oh|hey|hi|hello)$/i.test(text)) return "";
++	return text;
++}
++function loadAgenticModes() {
++	const modes = /* @__PURE__ */ new Map();
++	try {
++		const parsed = JSON.parse(readFileSync(AGENTIC_STATE_PATH, "utf8"));
++		for (const [guildId, enabled] of Object.entries(parsed)) if (typeof enabled === "boolean") modes.set(guildId, enabled);
++	} catch (error) {
++	}
++	return modes;
++}
++function saveAgenticModes(modes) {
++	try {
++		writeFileSync(AGENTIC_STATE_PATH, JSON.stringify(Object.fromEntries(modes)), { mode: 384 });
++	} catch (error) {
++	}
++}
++async function playAgenticSound(entry, path, label) {
++	entry.agenticEffectPlaying = true;
++	let timer;
++	let timedOut = false;
++	try {
++		await Promise.race([entry.audio.play(path), new Promise((resolve) => {
++			timer = setTimeout(() => {
++				timedOut = true;
++				try {
++					entry.audio.send?.({ type: "player-stop" });
++				} catch (error) {
++				}
++				logVoiceVerbose(`agentic sound timed out: ${label}`);
++				resolve();
++			}, AGENTIC_SOUND_TIMEOUT_MS);
++			timer.unref?.();
++		})]);
++	} catch (error) {
++		logVoiceVerbose(`agentic sound failed: ${label}: ${formatErrorMessage(error)}`);
++	} finally {
++		if (timer) clearTimeout(timer);
++		if (timedOut) {
++			try {
++				entry.audio.playerStatus = "idle";
++			} catch (error) {
++			}
++		}
++		entry.agenticEffectPlaying = false;
++	}
++}
++function agenticStateFor(entry, userId) {
++	if (!entry.agenticStates) entry.agenticStates = new Map();
++	let state = entry.agenticStates.get(userId);
++	if (!state) {
++		state = {
++			listening: false,
++			awaitingCommand: false,
++			timer: void 0,
++			lastStartAt: 0,
++			lastSpeechAt: 0,
++			pendingWakePrefix: "",
++			pendingWakeAt: 0
++		};
++		entry.agenticStates.set(userId, state);
++	}
++	return state;
++}
++function clearAgenticTimer(state) {
++	if (state.timer) {
++		clearTimeout(state.timer);
++		state.timer = void 0;
++	}
++}
++function syncAgenticCaptureGrace(entry) {
++	try {
++		const listening = [...entry.agenticStates?.values() ?? []].some((state) => state.listening);
++		entry.audio.send?.({
++			type: "capture-grace",
++			ms: listening ? 3000 : 1000
++		});
++	} catch (error) {
++	}
++}
++function enqueueAgenticSound(entry, path, label) {
++	entry.playbackQueue = (entry.playbackQueue ?? Promise.resolve())
++		.then(() => playAgenticSound(entry, path, label))
++		.catch((error) => logVoiceVerbose(`agentic sound queue failed: ${label}: ${formatErrorMessage(error)}`));
++}
++function clearAgenticState(entry, userId) {
++	const state = agenticStateFor(entry, userId);
++	clearAgenticTimer(state);
++	state.listening = false;
++	state.awaitingCommand = false;
++	state.pendingWakePrefix = "";
++	state.pendingWakeAt = 0;
++	syncAgenticCaptureGrace(entry);
++}
++function stopAgenticListening(entry, userId) {
++	const state = agenticStateFor(entry, userId);
++	if (!state.listening) return false;
++	clearAgenticTimer(state);
++	state.listening = false;
++	state.awaitingCommand = false;
++	state.pendingWakePrefix = "";
++	state.pendingWakeAt = 0;
++	enqueueAgenticSound(entry, AGENTIC_DONE_SOUND, "done");
++	syncAgenticCaptureGrace(entry);
++	logVoiceVerbose(`agentic mode: listening stopped guild=${entry.guildId} channel=${entry.channelId} user=${userId}`);
++	return true;
++}
++function scheduleAgenticStop(entry, userId, ms = AGENTIC_STOP_MS) {
++	const state = agenticStateFor(entry, userId);
++	if (!state.listening) return;
++	clearAgenticTimer(state);
++	state.timer = setTimeout(() => {
++		if (state.listening) stopAgenticListening(entry, userId);
++	}, ms);
++	state.timer.unref?.();
++}
++function noteAgenticSpeech(entry, userId) {
++	const state = agenticStateFor(entry, userId);
++	if (!state.listening || !state.awaitingCommand) return;
++	const now = Date.now();
++	if (now - state.lastSpeechAt < 200) return;
++	state.lastSpeechAt = now;
++	scheduleAgenticStop(entry, userId, AGENTIC_STOP_MS);
++}
++function pcmHasVoice(pcm) {
++	try {
++		if (!pcm?.length) return false;
++		const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.length / 2));
++		let sum = 0;
++		let count = 0;
++		for (let i = 0; i < samples.length; i += 16) {
++			const value = samples[i];
++			sum += value * value;
++			count += 1;
++		}
++		return count > 0 && Math.sqrt(sum / count) >= 600;
++	} catch (error) {
++		return false;
++	}
++}
+ function formatVoiceLogPreview(text) {
+ 	const oneLine = text.replace(/\s+/g, " ").trim();
+ 	if (oneLine.length <= DISCORD_VOICE_LOG_PREVIEW_CHARS) return oneLine;
+@@ -137,20 +303,30 @@
+ const DISCORD_VOICE_SPOKEN_OUTPUT_CONTRACT = [
+ 	"You are OpenClaw's Discord voice interface in a live voice channel.",
+ 	"Discord voice reply requirements:",
++	"- You are Jim, the user's discreet butler. Speak in first person as Jim.",
+ 	"- Return only the concise text that should be spoken aloud in the voice channel.",
+ 	"- Treat the transcript as speech-to-text from a live conversation; repair obvious transcription artifacts and ignore repeated partial fragments caused by voice buffering.",
+ 	"- If the transcript is garbled, incomplete, or missing the user's intent, ask one brief clarifying question instead of guessing.",
+-	"- If the request needs deeper reasoning, current information, or tools, use the available tools before answering.",
++	"- This is a spoken voice call: no tools are available. Do not run shell commands, inspect files, start subagents, or debug tools. If an action requires those, say briefly that it has to be done in text chat.",
++	"- Answer directly from what you know. Keep it spoken and brief.",
+ 	"- Do not call the tts tool; Discord voice will synthesize and play the returned text.",
+ 	"- Do not reply with NO_REPLY unless no spoken response is appropriate.",
+ 	"- Keep the response brief, natural, and conversational. Prefer one to three short sentences.",
+ 	"- Avoid markdown tables, code fences, citations, and visual formatting unless the user explicitly asks for something that cannot be spoken naturally."
+ ].join("\n");
+-function formatVoiceIngressPrompt(transcript, speakerLabel) {
++function formatVoiceIngressPrompt(transcript, speakerLabel, history = []) {
+ 	const cleanedTranscript = transcript.trim();
+ 	const cleanedLabel = speakerLabel?.trim();
++	const recent = history.slice(-8).map((entry) => {
++		const who = entry.role === "assistant" ? "Jim" : `Speaker ${entry.speaker ?? "unknown"}`;
++		return `${who}: ${entry.text}`;
++	}).join("\n");
+ 	const voiceInput = cleanedLabel ? [`Voice transcript from speaker "${cleanedLabel}":`, cleanedTranscript].join("\n") : cleanedTranscript;
+-	return [DISCORD_VOICE_SPOKEN_OUTPUT_CONTRACT, voiceInput].join("\n\n");
++	return [
++		DISCORD_VOICE_SPOKEN_OUTPUT_CONTRACT,
++		recent ? `Recent call context:\n${recent}` : "",
++		voiceInput
++	].filter(Boolean).join("\n\n");
+ }
+ //#endregion
+ //#region extensions/discord/src/voice/realtime-recording.ts
+@@ -391,6 +567,86 @@
+ 		speakerLabel: speaker.label
+ 	};
+ }
++async function callGatewayCli(method, params, timeoutMs) {
++	const { stdout } = await execFileAsync(OPENCLAW_BIN, [
++		"gateway",
++		"call",
++		method,
++		"--params",
++		JSON.stringify(params),
++		"--json"
++	], {
++		timeout: timeoutMs,
++		maxBuffer: 4 * 1024 * 1024
++	});
++	const lines = stdout.trim().split(/\r?\n/);
++	for (let i = lines.length - 1; i >= 0; i--) {
++		if (!lines[i].trimStart().startsWith("{")) continue;
++		try {
++			const result = JSON.parse(lines.slice(i).join("\n"));
++			if (result?.ok === false) throw new Error(result?.error?.message ?? `Gateway CLI ${method} failed`);
++			return result;
++		} catch (error) {
++			if (error instanceof SyntaxError) continue;
++			throw error;
++		}
++	}
++	throw new Error(`Gateway CLI ${method} returned no JSON`);
++}
++async function runVoiceAgentViaCliGateway(params) {
++	const idempotencyKey = randomUUID();
++	const accepted = await callGatewayCli("agent", {
++		message: params.message,
++		sessionKey: params.entry.route.sessionKey,
++		agentId: params.entry.route.agentId,
++		deliver: false,
++		idempotencyKey,
++		// Voice is a direct model turn: no tools, no shell, no agent loops.
++		modelRun: true,
++		channel: "discord",
++		accountId: params.accountId,
++		extraSystemPrompt: params.context.extraSystemPrompt,
++		disableMessageTool: true
++	}, 30000);
++	const runId = accepted?.runId ?? idempotencyKey;
++	const waited = await callGatewayCli("agent.wait", {
++		runId,
++		timeoutMs: 120000
++	}, 130000);
++	if (waited?.status !== "ok") throw new Error(`Gateway agent run ended with status ${waited?.status ?? "unknown"}`);
++	return (waited.terminalReply?.text ?? "").trim();
++}
++async function runVoiceAgentViaGateway(params) {
++	const gateway = getDiscordRuntime().gateway;
++	if (!gateway || typeof gateway.request !== "function") throw new Error("Gateway RPC is unavailable");
++	if (typeof gateway.isAvailable === "function" && !(await gateway.isAvailable())) throw new Error("Gateway RPC is unavailable");
++	const idempotencyKey = randomUUID();
++	const accepted = await gateway.request("agent", {
++		message: params.message,
++		sessionKey: params.entry.route.sessionKey,
++		agentId: params.entry.route.agentId,
++		deliver: false,
++		idempotencyKey,
++		// Voice is a direct model turn: no tools, no shell, no agent loops.
++		modelRun: true,
++		channel: "discord",
++		accountId: params.accountId,
++		extraSystemPrompt: params.context.extraSystemPrompt,
++		disableMessageTool: true
++	}, { timeoutMs: 30000 });
++	const runId = accepted?.runId ?? idempotencyKey;
++	const waited = await gateway.request("agent.wait", {
++		runId,
++		timeoutMs: 120000
++	}, { timeoutMs: 125000 });
++	if (waited?.status !== "ok") throw new Error(`Gateway agent run ended with status ${waited?.status ?? "unknown"}`);
++	return (waited.terminalReply?.text ?? "").trim();
++}
++function isTransientVoiceGatewayError(error) {
++	const name = readErrorName(error);
++	const message = formatErrorMessage(error);
++	return name === "GatewayDrainingError" || /Gateway is (?:temporarily unavailable|restarting|temporarily paused|shutting down)/i.test(message);
++}
+ async function runDiscordVoiceAgentTurn(params) {
+ 	const { context } = params;
+ 	if (params.entry.captureOnly || params.entry.sessionLifecycle.status !== "active" || context.isCurrent?.() === false) return null;
+@@ -404,24 +660,57 @@
+ 			if (params.entry.sessionLifecycle.status !== "active" || context.isCurrent?.() === false) throw new Error("Discord voice access is no longer valid for this call");
+ 		}
+ 	}) : void 0;
++	let gatewayText = null;
++	try {
++		gatewayText = await runVoiceAgentViaCliGateway(params);
++	} catch (error) {
++		logger$9.warn(`discord voice: external Gateway turn failed; trying in-process RPC: ${formatErrorMessage(error)}`);
++	}
++	if (gatewayText === null) {
++		try {
++			gatewayText = await runVoiceAgentViaGateway(params);
++		} catch (error) {
++			logger$9.warn(`discord voice: in-process Gateway turn failed; using legacy fallback: ${formatErrorMessage(error)}`);
++		}
++	}
++	if (gatewayText !== null) {
++		unbind?.();
++		return gatewayText;
++	}
+ 	let result;
+ 	try {
+-		result = await getDiscordRuntime().agent.runCommandFromIngress({
+-			message: params.message,
+-			sessionKey: params.entry.route.sessionKey,
+-			agentId: params.entry.route.agentId,
+-			messageChannel: "discord",
+-			messageProvider: DISCORD_VOICE_MESSAGE_PROVIDER,
+-			accountId: params.accountId,
+-			extraSystemPrompt: context.extraSystemPrompt,
+-			senderIsOwner: context.senderIsOwner,
+-			allowModelOverride: Boolean(voiceModel),
+-			model: voiceModel,
+-			toolsAllow: params.toolsAllow,
+-			deliver: false,
+-			...runId ? { runId } : {},
+-			...params.signal ? { abortSignal: params.signal } : {}
+-		}, params.runtime);
++		let lastError;
++		for (let attempt = 0; attempt < 4; attempt++) {
++			try {
++				result = await getDiscordRuntime().agent.runCommandFromIngress({
++					message: params.message,
++					sessionKey: params.entry.route.sessionKey,
++					agentId: params.entry.route.agentId,
++					messageChannel: "discord",
++					messageProvider: DISCORD_VOICE_MESSAGE_PROVIDER,
++					accountId: params.accountId,
++					extraSystemPrompt: context.extraSystemPrompt,
++					senderIsOwner: context.senderIsOwner,
++					allowModelOverride: Boolean(voiceModel),
++					model: voiceModel,
++					toolsAllow: params.toolsAllow,
++					deliver: false,
++					...runId ? { runId } : {},
++					...params.signal ? { abortSignal: params.signal } : {}
++				}, params.runtime);
++				lastError = void 0;
++				break;
++			} catch (error) {
++				lastError = error;
++				if (!isTransientVoiceGatewayError(error) || attempt === 3 || params.signal?.aborted) throw error;
++				logger$9.warn(`discord voice: gateway admission busy; retrying voice turn attempt ${attempt + 1}/3: ${formatErrorMessage(error)}`);
++				await new Promise((resolve) => {
++					const timer = setTimeout(resolve, 1500 * (attempt + 1));
++					timer.unref?.();
++				});
++			}
++		}
++		if (!result) throw lastError ?? new Error("Discord voice agent turn produced no result");
+ 	} finally {
+ 		unbind?.();
+ 	}
+@@ -1357,6 +1646,10 @@
+ 	if (processing === "omitted") return { status: "excluded" };
+ 	if (!transcript) {
+ 		logVoiceVerbose(`transcription empty: guild ${entry.guildId} channel ${entry.channelId} user ${userId}`);
++		// The 3s endpointer produced a segment with no words. If a wake
++		// session is open for this speaker, close it with the matching done
++		// cue instead of leaving the mic latched open.
++		if (entry.agenticStates?.get(userId)?.listening) stopAgenticListening(entry, userId);
+ 		return {
+ 			status: "empty",
+ 			conversationAuthorized
+@@ -1387,9 +1680,82 @@
+ 	};
+ }
+ async function respondToDiscordVoiceTranscript(params) {
+-	const { entry, ingress, transcript, userId } = params;
++	const { entry, ingress, userId } = params;
++	let transcript = params.transcript;
+ 	const conversationCurrent = () => !entry.captureOnly && entry.sessionLifecycle.status === "active" && ingress.isCurrent?.() !== false;
+ 	if (!conversationCurrent()) return;
++	const agentic = params.agenticMode === true;
++	if (agentic) {
++		// A single call is one conversation lane: do not start another
++		// listening cue or second turn while the previous request is still
++		// being answered.
++		if (entry.agenticBusy === true) {
++			logVoiceVerbose(`agentic mode: busy with previous request; ignoring transcript guild=${entry.guildId} channel=${entry.channelId} user=${userId}`);
++			return;
++		}
++		const state = agenticStateFor(entry, userId);
++		const pendingPrefix = state.pendingWakePrefix
++			&& Date.now() - state.pendingWakeAt <= 3000
++			? state.pendingWakePrefix
++			: "";
++		const effectiveTranscript = pendingPrefix ? `${pendingPrefix} ${transcript}` : transcript;
++		let wakeMatch = AGENTIC_WAKE_RE.exec(effectiveTranscript);
++		if (!wakeMatch && !state.awaitingCommand) {
++			// A natural pause can split "hey ... Jim" into two transcripts.
++			// Hold a lone wake prefix briefly and combine it with the next one.
++			if (/^(?:hey|hi|hello|hay)[\s,]*$/i.test(transcript.trim())) {
++				state.pendingWakePrefix = transcript.trim();
++				state.pendingWakeAt = Date.now();
++				logVoiceVerbose(`agentic mode: holding wake prefix guild=${entry.guildId} channel=${entry.channelId} user=${userId}`);
++				return;
++			}
++			state.pendingWakePrefix = "";
++			state.pendingWakeAt = 0;
++			// There is no automatic follow-up window any more: every new
++			// request must start with the wake phrase.
++			logVoiceVerbose(`agentic mode: ignored transcript without wake word guild=${entry.guildId} channel=${entry.channelId} user=${userId}`);
++			return;
++		}
++		if (wakeMatch) {
++			state.pendingWakePrefix = "";
++			state.pendingWakeAt = 0;
++		}
++		if (!wakeMatch && state.awaitingCommand && cleanAgenticCommand(transcript) === "") {
++			// A filler/noise word while listening does not end the request.
++			scheduleAgenticStop(entry, userId, AGENTIC_STOP_MS);
++			return;
++		}
++		if (!wakeMatch && AGENTIC_CLOSING_RE.test(transcript)) {
++			state.awaitingCommand = false;
++			stopAgenticListening(entry, userId);
++			return;
++		}
++		if (wakeMatch) {
++			if (!state.listening) {
++				params.enqueuePlayback(entry, async () => {
++					await playAgenticSound(entry, AGENTIC_WAKE_SOUND, "wake");
++				});
++				state.listening = true;
++				syncAgenticCaptureGrace(entry);
++			}
++			state.lastStartAt = Date.now();
++			const command = cleanAgenticCommand(wakeMatch[1]);
++			if (!command) {
++				state.awaitingCommand = true;
++				scheduleAgenticStop(entry, userId, AGENTIC_STOP_MS);
++				return;
++			}
++			state.awaitingCommand = false;
++			stopAgenticListening(entry, userId);
++			entry.agenticBusy = true;
++			transcript = command;
++		} else {
++			state.awaitingCommand = false;
++			stopAgenticListening(entry, userId);
++			entry.agenticBusy = true;
++		}
++	}
++	const voiceHistory = entry.voiceHistory ??= [];
+ 	let replyText;
+ 	const control = await maybeControlDiscordVoiceAgentRun({
+ 		entry,
+@@ -1404,45 +1770,84 @@
+ 		}
+ 		logger$6.warn(`discord voice: active-run control failed; falling back to normal segment handling: ${formatErrorMessage(error)}`);
+ 	});
+-	if (control === null || !conversationCurrent()) return;
++	if (control === null || !conversationCurrent()) {
++		if (agentic) entry.agenticBusy = false;
++		return;
++	}
+ 	if (control?.handled) {
+ 		logger$6.info(`discord voice: active-run control handled mode=${control.result.mode} ok=${control.result.ok} active=${control.result.active} reason=${control.result.reason ?? "none"} session=${entry.route.sessionKey}`);
+ 		replyText = control.speakText ?? "";
+ 	} else {
+-		const prompt = formatVoiceIngressPrompt(transcript, ingress.speakerLabel);
+-		const text = await runDiscordVoiceAgentTurn({
+-			entry,
+-			accountId: params.accountId,
+-			userId,
+-			message: prompt,
+-			discordConfig: params.discordConfig,
+-			runtime: params.runtime,
+-			context: ingress
+-		});
++		const prompt = formatVoiceIngressPrompt(transcript, ingress.speakerLabel, voiceHistory);
++		let text;
++		try {
++			text = await runDiscordVoiceAgentTurn({
++				entry,
++				accountId: params.accountId,
++				userId,
++				message: prompt,
++				discordConfig: params.discordConfig,
++				runtime: params.runtime,
++				context: ingress,
++				toolsAllow: []
++			});
++		} catch (error) {
++			if (readErrorName(error) === "AbortError") {
++				if (agentic) entry.agenticBusy = false;
++				return;
++			}
++			logger$6.warn(`discord voice: agent turn failed; speaking fallback: ${formatErrorMessage(error)}`);
++			text = "Apologies, sir - I hit a temporary gateway problem. Please say that again.";
++		}
+ 		if (text === null) {
+ 			logVoiceVerbose(`segment unauthorized before agent turn: guild ${entry.guildId} channel ${entry.channelId} user ${userId}`);
++			if (agentic) entry.agenticBusy = false;
+ 			return;
+ 		}
+ 		replyText = text;
+ 	}
+-	if (!conversationCurrent()) return;
++	if (!conversationCurrent()) {
++		if (agentic) entry.agenticBusy = false;
++		return;
++	}
+ 	if (!replyText) {
+ 		logVoiceVerbose(`reply empty: guild ${entry.guildId} channel ${entry.channelId} user ${userId}`);
+-		return;
++		replyText = "Sorry, I didn't catch an answer for that. Please say it again.";
+ 	}
++	voiceHistory.push({ role: "user", text: transcript, speaker: ingress.speakerLabel });
++	voiceHistory.push({ role: "assistant", text: replyText });
++	if (voiceHistory.length > 12) voiceHistory.splice(0, voiceHistory.length - 12);
+ 	logVoiceVerbose(`reply ok (${replyText.length} chars): guild ${entry.guildId} channel ${entry.channelId}`);
+-	const voiceReplyAudio = await synthesizeVoiceReplyAudio({
+-		cfg: params.cfg,
+-		override: params.discordConfig.voice?.tts,
+-		replyText,
+-		speakerLabel: ingress.speakerLabel
+-	});
++	let voiceReplyAudio;
++	try {
++		voiceReplyAudio = await synthesizeVoiceReplyAudio({
++			cfg: params.cfg,
++			override: params.discordConfig.voice?.tts,
++			replyText,
++			speakerLabel: ingress.speakerLabel
++		});
++	} catch (error) {
++		logger$6.warn(`discord voice: TTS synthesis threw: ${formatErrorMessage(error)}`);
++		if (agentic) {
++			entry.agenticBusy = false;
++			clearAgenticState(entry, userId);
++		}
++		return;
++	}
+ 	if (voiceReplyAudio.status === "empty") {
+ 		logVoiceVerbose(`tts skipped (empty): guild ${entry.guildId} channel ${entry.channelId} user ${userId}`);
++		if (agentic) {
++			clearAgenticState(entry, userId);
++			entry.agenticBusy = false;
++		}
+ 		return;
+ 	}
+ 	if (voiceReplyAudio.status === "failed") {
+ 		logger$6.warn(`discord voice: TTS failed: ${voiceReplyAudio.error ?? "unknown error"}`);
++		if (agentic) {
++			clearAgenticState(entry, userId);
++			entry.agenticBusy = false;
++		}
+ 		return;
+ 	}
+ 	const streamFailure = voiceReplyAudio.mode === "file" ? voiceReplyAudio.streamFailure : void 0;
+@@ -1453,19 +1858,48 @@
+ 	logVoiceVerbose(`tts ok (${voiceReplyAudio.speakText.length} chars): guild ${entry.guildId} channel ${entry.channelId}`);
+ 	const releaseAudio = voiceReplyAudio.mode === "stream" ? voiceReplyAudio.release : () => unlinkIfExists(voiceReplyAudio.audioPath);
+ 	if (entry.sessionLifecycle.status === "stopped") {
++		if (agentic) entry.agenticBusy = false;
+ 		await releaseAudio?.();
+ 		return;
+ 	}
+ 	params.enqueuePlayback(entry, async () => {
++		let playbackTimer;
++		let idleListener;
++		const playerIdle = new Promise((resolve) => {
++			idleListener = resolve;
++			entry.audio.once("player-idle", resolve);
++		});
+ 		try {
+ 			if (entry.sessionLifecycle.status === "stopped") return;
++			entry.agenticTtsPlaying = true;
+ 			const input = voiceReplyAudio.mode === "stream" ? Readable.fromWeb(voiceReplyAudio.audioStream) : voiceReplyAudio.audioPath;
+ 			logVoiceVerbose(`playback start: guild ${entry.guildId} channel ${entry.channelId} ${voiceReplyAudio.mode}`);
+-			await entry.audio.play(input);
++			await Promise.race([entry.audio.play(input), playerIdle, new Promise((resolve) => {
++				playbackTimer = setTimeout(() => {
++					try {
++						entry.audio.send?.({ type: "player-stop" });
++					} catch (error) {
++					}
++					logger$6.warn(`discord voice: TTS playback timed out; releasing voice state`);
++					resolve();
++				}, 20000);
++				playbackTimer.unref?.();
++			})]);
+ 			logVoiceVerbose("playback done: guild " + entry.guildId + " channel " + entry.channelId);
+ 		} catch (error) {
+ 			if (entry.sessionLifecycle.status !== "stopped") throw error;
+ 		} finally {
++			if (playbackTimer) clearTimeout(playbackTimer);
++			if (idleListener) entry.audio.off("player-idle", idleListener);
++			entry.agenticTtsPlaying = false;
++			try {
++				entry.audio.playerStatus = "idle";
++			} catch (error) {
++			}
++			if (agentic) {
++				entry.agenticBusy = false;
++				clearAgenticState(entry, userId);
++			}
+ 			await releaseAudio?.();
+ 		}
+ 	});
+@@ -1633,7 +2067,13 @@
+ 		const capture = entry.transcripts;
+ 		const realtime = entry.realtimeLifecycle.status === "active" ? entry.realtimeLifecycle.instance : void 0;
+ 		const playing = entry.audio.playerStatus === "playing";
+-		const conversationAllowed = origin === "native" && !entry.captureOnly && !(playing && !realtime?.canReceiveDuringPlayback());
++		const effectPlaying = entry.agenticEffectPlaying === true;
++		const ttsPlaying = entry.agenticTtsPlaying === true;
++		const agenticListening = entry.agenticStates?.get(userId)?.listening === true;
++		// Only active TTS is protected playback. Earcons and a stale player
++		// status must never drop the next wake phrase.
++		const playbackBlocked = playing && ttsPlaying && !effectPlaying && !agenticListening && !realtime?.canReceiveDuringPlayback();
++		const conversationAllowed = origin === "native" && !entry.captureOnly && !playbackBlocked;
+ 		if (!capture && !conversationAllowed) {
+ 			logVoiceVerbose(`capture ignored: guild ${entry.guildId} channel ${entry.channelId} user ${userId} reason=${playing ? "protected playback" : "inactive capture"}`);
+ 			return;
+@@ -1728,6 +2168,7 @@
+ 				resetReceiveRecovery = true;
+ 				this.resetDecryptFailureState(entry);
+ 			}
++			if (pcmHasVoice(frame.pcm)) this.params.onSpeechActivity?.(entry, userId);
+ 			pendingPackets += 1;
+ 			pendingBytes += packetBytes;
+ 			const receipt = {
+@@ -1837,6 +2278,7 @@
+ 						if (!currentIngress || !this.params.isEntryCurrent(entry)) return;
+ 						await respondToDiscordVoiceTranscript({
+ 							...this.responseContext(entry, userId),
++							agenticMode: this.params.isAgenticMode?.(entry.guildId) === true,
+ 							ingress: currentIngress,
+ 							transcript
+ 						});
+@@ -2201,6 +2643,7 @@
+ 				break;
+ 			case "player":
+ 				this.playerStatus = event.status;
++				if (event.status === "idle") this.emit("player-idle");
+ 				break;
+ 			case "speaking":
+ 				if (event.speaking) this.speakingUsers.add(event.userId);
+@@ -2662,7 +3105,13 @@
+ 				channelId
+ 			};
+ 		}
+-		const { route, voiceRoute, agentSessionMode, agentSessionTarget } = routeInfo;
++		const { route: baseRoute, voiceRoute: baseVoiceRoute, agentSessionMode, agentSessionTarget } = routeInfo;
++		// A fresh call gets a fresh agent session. The default "voice" mode must
++		// not reuse the text channel's transcript forever; explicit
++		// agentSession.mode="target" still shares the configured target.
++		const callId = agentSessionMode === "target" ? "" : `:call:${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
++		const route = callId ? { ...baseRoute, sessionKey: `${baseRoute.sessionKey}${callId}` } : baseRoute;
++		const voiceRoute = callId ? { ...baseVoiceRoute, sessionKey: `${baseVoiceRoute.sessionKey}${callId}` } : baseVoiceRoute;
+ 		logger$2.info(`discord voice: joining guild=${guildId} channel=${channelId} mode=${voiceMode} agent=${route.agentId} voiceSession=${voiceRoute.sessionKey} supervisorSession=${route.sessionKey} agentSessionMode=${agentSessionMode}${agentSessionTarget ? ` agentSessionTarget=${agentSessionTarget}` : ""} voiceModel=${voiceConfig?.model ?? "route-default"} realtimeProvider=${voiceConfig?.realtime?.provider ?? "auto"} realtimeModel=${voiceConfig?.realtime?.model ?? "provider-default"} realtimeVoice=${voiceConfig?.realtime?.speakerVoice ?? voiceConfig?.realtime?.speakerVoiceId ?? "provider-default"}`);
+ 		let stopCompletion;
+ 		const stopEntry = (reason) => {
+@@ -2770,6 +3219,7 @@
+ 		entry.audio.enablePassthrough("post-join warmup", 30);
+ 		audio.on("speaking", speakingHandler);
+ 		this.params.sessions.set(guildId, entry);
++		syncAgenticCaptureGrace(entry);
+ 		this.params.membership.activate(entry, this.params.botUserId());
+ 		logger$2.info(`discord voice: joined guild=${guildId} channel=${channelId} mode=${voiceMode} agent=${route.agentId} voiceSession=${voiceRoute.sessionKey} supervisorSession=${route.sessionKey} voiceModel=${voiceConfig?.model ?? "route-default"}`);
+ 		return {
+@@ -2947,6 +3397,7 @@
+ var DiscordVoiceManager = class {
+ 	constructor(params) {
+ 		this.sessions = /* @__PURE__ */ new Map();
++		this.agenticModes = loadAgenticModes();
+ 		this.guildLifecycles = /* @__PURE__ */ new Map();
+ 		this.nextGuildGeneration = 0;
+ 		this.joinTasks = /* @__PURE__ */ new Map();
+@@ -2957,6 +3408,8 @@
+ 		this.client = params.client;
+ 		this.readPolicy = params.readPolicy;
+ 		this.botUserId = params.botUserId;
++		this.cfg = params.cfg;
++		this.discordConfig = params.discordConfig;
+ 		this.voiceEnabled = resolveDiscordVoiceEnabled(params.discordConfig.voice);
+ 		this.getTranscripts = ({ guildId, channelId }) => this.destroyed ? void 0 : resolveDiscordTranscriptsCapture({
+ 			guildId,
+@@ -2985,6 +3438,8 @@
+ 			client: params.client,
+ 			discordConfig: params.discordConfig,
+ 			getSession: (guildId) => this.sessions.get(guildId),
++			isAgenticMode: (guildId) => this.agenticModes.get(guildId) === true,
++			onSpeechActivity: (entry, userId) => noteAgenticSpeech(entry, userId),
+ 			isEntryCurrent: (entry) => this.isEntryCurrent(entry),
+ 			isFollowOwnedGuild: (guildId) => this.following.isFollowOwnedGuild(guildId),
+ 			join: (entry, options) => this.join(entry, options),
+@@ -3081,6 +3536,43 @@
+ 		if (!entry?.whenOccupied || !this.voiceEnabled || this.destroyed) return;
+ 		await this.enqueueAutoJoin(entry);
+ 	}
++	async speak(params) {
++		const text = typeof params?.text === "string" ? params.text.trim() : "";
++		if (!text) return { ok: false, message: "Nothing to say." };
++		const guildId = (params.guildId ?? this.sessions.keys().next().value ?? "").trim();
++		let entry = this.sessions.get(guildId);
++		const channelId = (params.channelId ?? entry?.channelId ?? this.autoJoinChannels[0]?.channelId ?? "").trim();
++		if (!entry && guildId && channelId) {
++			const joined = await this.join({ guildId, channelId });
++			if (!joined.ok) return joined;
++			entry = this.sessions.get(guildId);
++		}
++		if (!entry || !this.isEntryCurrent(entry) || entry.sessionLifecycle.status !== "active") return { ok: false, message: "I'm not connected to a voice channel." };
++		const audio = await synthesizeVoiceReplyAudio({ cfg: this.cfg, override: this.discordConfig.voice?.tts, replyText: text, speakerLabel: "Jim" });
++		if (audio.status === "empty") return { ok: false, message: "Nothing to say." };
++		if (audio.status !== "ok") return { ok: false, message: `TTS failed: ${audio.error ?? "unknown error"}` };
++		const input = audio.mode === "stream" ? Readable.fromWeb(audio.audioStream) : audio.audioPath;
++		try {
++			await entry.audio.play(input);
++		} finally {
++			if (audio.mode === "stream") await audio.release?.();
++			else await unlinkIfExists(audio.audioPath);
++		}
++		return { ok: true, message: `Spoke ${audio.speakText.length} characters in ${formatMention({ channelId: entry.channelId })}.` };
++	}
++	setAgenticMode(guildId, enabled) {
++		const id = typeof guildId === "string" ? guildId.trim() : "";
++		if (!id) return { ok: false, message: "Missing guild id." };
++		this.agenticModes.set(id, enabled === true);
++		saveAgenticModes(this.agenticModes);
++		const entry = this.sessions.get(id);
++		if (entry) {
++			if (entry.agenticStates) for (const userId of [...entry.agenticStates.keys()]) clearAgenticState(entry, userId);
++			entry.agenticBusy = false;
++			entry.agenticMode = enabled === true;
++		}
++		return { ok: true, message: `Agentic voice mode ${enabled === true ? "enabled" : "disabled"}.` };
++	}
+ 	status() {
+ 		return Array.from(this.guildLifecycles.values()).filter((lifecycle) => lifecycle.status === "active").filter(({ instance }) => this.isEntryCurrent(instance)).map(({ instance: session }) => ({
+ 			ok: true,

@@ -1,0 +1,111 @@
+--- a/dist/.setup/provider-YP8gN9_o.mjs
++++ b/dist/.setup/provider-YP8gN9_o.mjs
+@@ -6956,6 +6956,90 @@
+ 			});
+ 		}
+ 	}
++	class SayCommand extends Command {
++		constructor(..._args) {
++			super(..._args);
++			this.name = "say";
++			this.description = "Speak text in the current voice channel";
++			this.defer = true;
++			this.ephemeral = params.ephemeralDefault;
++			this.options = [{
++				name: "text",
++				description: "Text to speak aloud",
++				type: ApplicationCommandOptionType.String,
++				required: true
++			}];
++		}
++		async run(interaction) {
++			const text = interaction.options.getString("text", true);
++			const guildId = interaction.guild?.id;
++			if (!guildId) {
++				await interaction.reply({ content: "Unable to resolve guild for this command.", ephemeral: true });
++				return;
++			}
++			const manager = params.getManager();
++			if (!manager) {
++				await interaction.reply({ content: "Voice manager is not available yet.", ephemeral: true });
++				return;
++			}
++			const sessions = manager.status().filter((entry) => entry.guildId === guildId);
++			const channelId = sessions[0]?.channelId;
++			const access = await authorizeVoiceCommand(interaction, params, { channelOverride: channelId ? { id: channelId } : void 0 });
++			if (!access.ok) {
++				await interaction.reply({ content: access.message, ephemeral: true });
++				return;
++			}
++			const result = await manager.speak({ guildId, text });
++			await interaction.reply({ content: result.message, ephemeral: true });
++		}
++	}
++	class AgenticCommand extends Command {
++		constructor(..._args) {
++			super(..._args);
++			this.name = "agentic";
++			this.description = "Turn wake-word agentic voice mode on or off";
++			this.defer = true;
++			this.ephemeral = params.ephemeralDefault;
++			this.options = [{
++				name: "state",
++				description: "on, off, or status",
++				type: ApplicationCommandOptionType.String,
++				required: true,
++				choices: [
++					{ name: "on", value: "on" },
++					{ name: "off", value: "off" },
++					{ name: "status", value: "status" }
++				]
++			}];
++		}
++		async run(interaction) {
++			const state = interaction.options.getString("state", true);
++			const guildId = interaction.guild?.id;
++			if (!guildId) {
++				await interaction.reply({ content: "Unable to resolve guild for this command.", ephemeral: true });
++				return;
++			}
++			const manager = params.getManager();
++			if (!manager) {
++				await interaction.reply({ content: "Voice manager is not available yet.", ephemeral: true });
++				return;
++			}
++			const sessions = manager.status().filter((entry) => entry.guildId === guildId);
++			const channelId = sessions[0]?.channelId;
++			const access = await authorizeVoiceCommand(interaction, params, { channelOverride: channelId ? { id: channelId } : void 0 });
++			if (!access.ok) {
++				await interaction.reply({ content: access.message, ephemeral: true });
++				return;
++			}
++			if (state === "status") {
++				const enabled = manager.agenticModes?.get(guildId) === true;
++				await interaction.reply({ content: `Agentic voice mode is ${enabled ? "on" : "off"}.`, ephemeral: true });
++				return;
++			}
++			const result = manager.setAgenticMode(guildId, state === "on");
++			await interaction.reply({ content: result.message, ephemeral: true });
++		}
++	}
+ 	class SessionCommand extends Command {
+ 		constructor(name) {
+ 			super();
+@@ -7020,6 +7104,8 @@
+ 			this.description = DISCORD_VOICE_COMMAND_SPEC.description;
+ 			this.subcommands = [
+ 				new JoinCommand(),
++				new SayCommand(),
++				new AgenticCommand(),
+ 				new SessionCommand("leave"),
+ 				new SessionCommand("status")
+ 			];
+@@ -9998,6 +10084,8 @@
+ 				manager: voiceManager
+ 			});
+ 			voiceManagerRef.current = voiceManager;
++			globalThis.__openclawDiscordVoiceManagers ??= /* @__PURE__ */ new Map();
++			globalThis.__openclawDiscordVoiceManagers.set(account.accountId, voiceManager);
+ 			registerDiscordListener(client.listeners, new DiscordVoiceGuildCreateListener(voiceManager));
+ 			registerDiscordListener(client.listeners, new DiscordVoiceReadyListener(voiceManager));
+ 			registerDiscordListener(client.listeners, new DiscordVoiceResumedListener(voiceManager));

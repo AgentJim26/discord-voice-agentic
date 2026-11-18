@@ -1,0 +1,54 @@
+{
+  tts: {
+    auto: "off",
+    provider: "tts-local-cli",
+    providers: {
+      "tts-local-cli": {
+        command: "/home/jim/.local/venvs/tts/bin/edge-tts",
+        args: ["--text", "{{Text}}", "--write-media", "{{OutputPath}}", "--no-progress"],
+        outputFormat: "mp3",
+        timeoutMs: 120000
+      }
+    }
+  },
+  tools: {
+    media: {
+      audio: {
+        enabled: true
+      },
+      models: [
+        {
+          type: "cli",
+          command: "/bin/bash",
+          args: [
+            "/home/jim/.openclaw/workspace/scripts/stt.sh",
+            "{{AttachmentPath}}"
+          ],
+          capabilities: ["audio"],
+          timeoutSeconds: 120
+        }
+      ]
+    }
+  },
+  channels: {
+    discord: {
+      intents: {
+        voiceStates: true
+      },
+      voice: {
+        enabled: true,
+        mode: "stt-tts",
+        captureSilenceGraceMs: 800,
+        allowedChannels: [
+          {
+            guildId: "YOUR_GUILD_ID",
+            channelId: "YOUR_VOICE_CHANNEL_ID"
+          }
+        ],
+        tts: {
+          provider: "tts-local-cli"
+        }
+      }
+    }
+  }
+}

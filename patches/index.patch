@@ -1,0 +1,18 @@
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -1,4 +1,6 @@
+ import { registerDiscordSubagentHooks } from "./subagent-hooks-api.js";
++import { registerDiscordVoiceSayTool } from "./voice-say-tool.js";
++import { registerDiscordVoiceAgenticTool } from "./voice-agentic-tool.js";
+ import { defineBundledChannelEntry, loadBundledEntryExportSync } from "openclaw/plugin-sdk/channel-entry-contract";
+ //#region extensions/discord/index.ts
+ var discord_default = defineBundledChannelEntry({
+@@ -24,6 +26,8 @@
+ 			exportName: "registerDiscordActivities"
+ 		})(api);
+ 		registerDiscordSubagentHooks(api);
++		registerDiscordVoiceSayTool(api);
++		registerDiscordVoiceAgenticTool(api);
+ 	},
+ 	registerCapabilities(api) {
+ 		loadBundledEntryExportSync(import.meta.url, {

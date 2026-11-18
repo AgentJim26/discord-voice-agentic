@@ -1,0 +1,13 @@
+--- a/openclaw.plugin.json
++++ b/openclaw.plugin.json
+@@ -28,6 +28,10 @@
+   "contracts": {
+     "transcriptSourceProviders": [
+       "discord-voice"
++    ],
++    "tools": [
++      "discord_voice_say",
++      "discord_voice_agentic"
+     ]
+   },
+   "transcriptSources": {
