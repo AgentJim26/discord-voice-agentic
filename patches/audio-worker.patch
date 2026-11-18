@@ -1,0 +1,12 @@
+--- a/dist/src/voice/audio-worker.runtime.js
++++ b/dist/src/voice/audio-worker.runtime.js
+@@ -667,6 +667,9 @@
+ 			case "capture":
+ 				this.track(this.capture(command.id, command.userId, command.recordingEpoch));
+ 				break;
++			case "capture-grace":
++				this.options.captureSilenceGraceMs = Math.min(30000, Math.max(1, Number(command.ms) || 600));
++				break;
+ 			case "capture-stop": {
+ 				const capture = this.captures.get(command.id);
+ 				if (capture) this.stopCapture(capture);

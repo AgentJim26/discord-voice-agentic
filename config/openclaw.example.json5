@@ -38,7 +38,9 @@
       voice: {
         enabled: true,
         mode: "stt-tts",
-        captureSilenceGraceMs: 800,
+        // Idle wait for a wake phrase. While listening, the runtime raises
+        // this to 3000 ms through the audio worker's capture-grace command.
+        captureSilenceGraceMs: 1000,
         allowedChannels: [
           {
             guildId: "YOUR_GUILD_ID",

@@ -16,6 +16,7 @@ for file in \
   "dist/index.js" \
   "dist/.setup/voice-runtime-DDymtIw8.mjs" \
   "dist/.setup/provider-YP8gN9_o.mjs" \
+  "dist/src/voice/audio-worker.runtime.js" \
   "openclaw.plugin.json"; do
   if [ -f "$PLUGIN_DIR/$file" ] && [ ! -f "$PLUGIN_DIR/$file.bak-$STAMP" ]; then
     cp -a "$PLUGIN_DIR/$file" "$PLUGIN_DIR/$file.bak-$STAMP"
@@ -23,7 +24,7 @@ for file in \
 done
 
 cd "$PLUGIN_DIR"
-for patch_file in index manifest voice-runtime provider; do
+for patch_file in index manifest voice-runtime audio-worker provider; do
   echo "Applying patches/$patch_file.patch"
   patch -p1 < "$ROOT/patches/$patch_file.patch"
 done
@@ -35,8 +36,11 @@ mkdir -p "$PLUGIN_DIR/assets"
 cp "$ROOT/assets/agentic-wake.mp3" "$ROOT/assets/agentic-done.mp3" "$PLUGIN_DIR/assets/"
 
 mkdir -p "$HOME/.openclaw/workspace/scripts"
-cp "$ROOT/scripts/stt.sh" "$ROOT/scripts/vosk_stt.py" "$HOME/.openclaw/workspace/scripts/"
-chmod +x "$HOME/.openclaw/workspace/scripts/stt.sh"
+cp "$ROOT/scripts/stt.sh" "$ROOT/scripts/vosk_stt.py" "$ROOT/scripts/vosk_server.py" "$ROOT/scripts/vosk_client.py" "$HOME/.openclaw/workspace/scripts/"
+chmod +x "$HOME/.openclaw/workspace/scripts/stt.sh" \
+  "$HOME/.openclaw/workspace/scripts/vosk_stt.py" \
+  "$HOME/.openclaw/workspace/scripts/vosk_server.py" \
+  "$HOME/.openclaw/workspace/scripts/vosk_client.py"
 
 echo
 echo "Installed."
